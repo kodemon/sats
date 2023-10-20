@@ -1,3 +1,5 @@
 RPC_URI=http://127.0.0.1:18443 # regtest:18443 testnet:18332 mainnet:8332
 RPC_USER=bitcoin
 RPC_PASS=bitcoin
+
+STORAGE_PATH=/absolute/path/to/sats.redb

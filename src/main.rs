@@ -1,96 +1,38 @@
 extern crate dotenv;
 
-use redis::Client;
-use redis::Commands;
-use redis::Connection;
+use std::collections::{HashMap, VecDeque};
 
-use std::{
-  collections::{HashMap, VecDeque},
-  io,
-};
-
-use bitcoin::{
-  consensus::{Decodable, Encodable},
-  OutPoint, Transaction,
-};
+use bitcoin::{OutPoint, Transaction};
 use dotenv::dotenv;
+use entry::{Entry, OutPointValue, SatRange};
+use rpc::RpcClient;
+use storage::Storage;
 
+mod entry;
 mod rpc;
+mod storage;
 
 const COIN_VALUE: u64 = 100_000_000;
 const SUBSIDY_HALVING_INTERVAL: u64 = 210_000;
-
-pub type OutPointValue = [u8; 36];
-
-impl Entry for OutPoint {
-  type Value = OutPointValue;
-
-  fn load(value: Self::Value) -> Self {
-    Decodable::consensus_decode(&mut io::Cursor::new(value)).unwrap()
-  }
-
-  fn store(self) -> Self::Value {
-    let mut value = [0; 36];
-    self.consensus_encode(&mut value.as_mut_slice()).unwrap();
-    value
-  }
-}
-
-pub trait Entry: Sized {
-  type Value;
-
-  fn load(value: Self::Value) -> Self;
-
-  fn store(self) -> Self::Value;
-}
-
-pub type SatRange = (u64, u64);
-
-impl Entry for SatRange {
-  type Value = [u8; 11];
-
-  fn load([b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10]: Self::Value) -> Self {
-    let raw_base = u64::from_le_bytes([b0, b1, b2, b3, b4, b5, b6, 0]);
-
-    // 51 bit base
-    let base = raw_base & ((1 << 51) - 1);
-
-    let raw_delta = u64::from_le_bytes([b6, b7, b8, b9, b10, 0, 0, 0]);
-
-    // 33 bit delta
-    let delta = raw_delta >> 3;
-
-    (base, base + delta)
-  }
-
-  fn store(self) -> Self::Value {
-    let base = self.0;
-    let delta = self.1 - self.0;
-    let n = u128::from(base) | u128::from(delta) << 51;
-    n.to_le_bytes()[0..11].try_into().unwrap()
-  }
-}
 
 #[tokio::main]
 async fn main() {
   dotenv().ok();
 
-  // ### Redis
-
-  let block_count = rpc::getblockcount().unwrap();
+  let storage = Storage::new();
+  let client = RpcClient::new();
+  let block_count = client.getblockcount().unwrap();
 
   let mut range_cache: HashMap<OutPointValue, Vec<u8>> = HashMap::new();
-  let mut input_cache: Vec<String> = Vec::new();
-  // let mut uncomitted = 0;
+  let mut flush_cache: Vec<OutPointValue> = Vec::new();
 
-  let mut height = get_height();
+  let mut height = storage.get_block_height().unwrap();
   while height <= block_count {
-    let block_hash = rpc::getblockhash(&height).unwrap();
-    let block = rpc::getblock(&block_hash).unwrap();
+    let block_hash = client.getblockhash(&height).unwrap();
+    let block = client.getblock(&block_hash).unwrap();
 
     let first = first_ordinal(height);
     let mut coinbase_inputs: VecDeque<(u64, u64)> = VecDeque::new();
-    let mut con = connect();
 
     coinbase_inputs.push_front((first, first + subsidy(height)));
 
@@ -98,7 +40,7 @@ async fn main() {
     let mut outputs_in_block = 0;
 
     for (_, tx) in block.txdata.iter().enumerate().skip(1) {
-      let mut input_sat_ranges: VecDeque<(u64, u64)> = VecDeque::new();
+      let mut input_sat_ranges: VecDeque<SatRange> = VecDeque::new();
 
       // ### Extract Inputs
       // Match inputs against previous output sat ranges and assign
@@ -106,16 +48,12 @@ async fn main() {
 
       for input in &tx.input {
         let key = input.previous_output.store();
-        let out = format!(
-          "{}:{}",
-          input.previous_output.txid, input.previous_output.vout
-        );
 
         let sat_ranges = match range_cache.remove(&key) {
           Some(range) => Ok(range),
-          None => match con.get(&out) {
+          None => match storage.get_ranges(&key) {
             Ok(range) => {
-              input_cache.push(out);
+              flush_cache.push(key.clone());
               Ok(range)
             }
             Err(_) => Err(format!(
@@ -162,17 +100,24 @@ async fn main() {
 
     println!("{} / {}", height, block_count);
 
-    height += 1;
+    if height == 2_413_342 {
+      panic!("Time to prepare for inscriptions");
+    }
 
-    for (outpoint, sat_range) in range_cache.drain() {
-      let parsed = OutPoint::load(outpoint);
-      let location = format!("{}:{}", parsed.txid, parsed.vout);
-      let _: () = con.set(location, sat_range.as_slice()).unwrap();
+    if height % 5000 == 0 {
+      storage
+        .insert_ranges(&range_cache)
+        .expect("Failed to insert sat ranges");
+      storage
+        .flush_ranges(&flush_cache)
+        .expect("Failed to flush sat ranges");
+      storage
+        .set_block_height(height)
+        .expect("Failed to set block height");
+      range_cache = HashMap::new();
     }
-    let _: () = con.set("height", height).unwrap();
-    for outpoint in input_cache.drain(..) {
-      let _: () = con.del(outpoint).unwrap();
-    }
+
+    height += 1;
   }
 }
 
@@ -231,14 +176,4 @@ fn first_ordinal(height: u64) -> u64 {
 
 fn subsidy(height: u64) -> u64 {
   (50 * COIN_VALUE) / 2_u64.pow((height / SUBSIDY_HALVING_INTERVAL) as u32)
-}
-
-fn connect() -> Connection {
-  let client = Client::open("redis://127.0.0.1/").unwrap();
-  client.get_connection().unwrap()
-}
-
-fn get_height() -> u64 {
-  let mut connection = connect();
-  connection.get("height").unwrap_or(0)
 }
