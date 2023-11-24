@@ -1,6 +1,6 @@
 use bitcoincore_rpc::bitcoin::{Block, BlockHash};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use std::env;
+// use std::env;
 use std::error::Error;
 
 pub struct RpcClient {
@@ -9,12 +9,10 @@ pub struct RpcClient {
 
 impl RpcClient {
   pub fn new() -> RpcClient {
-    let username =
-      env::var("RPC_USER").expect("Bitcoin Core RPC username is not defined in environment");
-    let password =
-      env::var("RPC_PASS").expect("Bitcoin Core RPC password is not defined in environment");
+    let username = String::from("bitcoin"); // env::var("RPC_USER").expect("Bitcoin Core RPC username is not defined in environment");
+    let password = String::from("bitcoin"); // env::var("RPC_PASS").expect("Bitcoin Core RPC password is not defined in environment");
     let credential = Auth::UserPass(username, password);
-    let uri = env::var("RPC_URI").expect("Bitcoin Core RPC Uri is not defined in environment");
+    let uri = "http://127.0.0.1:18332"; // env::var("RPC_URI").expect("Bitcoin Core RPC Uri is not defined in environment");
     return RpcClient {
       client: Client::new(&uri, credential).expect("Unable to connect"),
     };

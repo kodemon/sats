@@ -3,7 +3,6 @@ extern crate dotenv;
 use std::collections::{HashMap, VecDeque};
 
 use bitcoin::{OutPoint, Transaction};
-use dotenv::dotenv;
 use entry::{Entry, OutPointValue, SatRange};
 use rpc::RpcClient;
 use storage::Storage;
@@ -17,8 +16,6 @@ const SUBSIDY_HALVING_INTERVAL: u64 = 210_000;
 
 #[tokio::main]
 async fn main() {
-  dotenv().ok();
-
   let storage = Storage::new();
   let client = RpcClient::new();
   let block_count = client.getblockcount().unwrap();
@@ -26,7 +23,7 @@ async fn main() {
   let mut range_cache: HashMap<OutPointValue, Vec<u8>> = HashMap::new();
   let mut flush_cache: Vec<OutPointValue> = Vec::new();
 
-  let mut height = storage.get_block_height().unwrap();
+  let mut height = storage.get_block_height() + 1;
   while height <= block_count {
     let block_hash = client.getblockhash(&height).unwrap();
     let block = client.getblock(&block_hash).unwrap();
@@ -50,19 +47,11 @@ async fn main() {
         let key = input.previous_output.store();
 
         let sat_ranges = match range_cache.remove(&key) {
-          Some(range) => Ok(range),
-          None => match storage.get_ranges(&key) {
-            Ok(range) => {
-              flush_cache.push(key.clone());
-              Ok(range)
-            }
-            Err(_) => Err(format!(
-              "Could not find outpoint {} in index",
-              input.previous_output
-            )),
-          },
-        }
-        .unwrap();
+          Some(range) => range,
+          None => storage.get_ranges(&key),
+        };
+
+        flush_cache.push(key);
 
         for chunk in sat_ranges.chunks_exact(11) {
           input_sat_ranges.push_back(SatRange::load(chunk.try_into().unwrap()))
@@ -98,27 +87,34 @@ async fn main() {
       &mut outputs_in_block,
     );
 
-    println!("{} / {}", height, block_count);
-
-    if height == 2_413_342 {
-      panic!("Time to prepare for inscriptions");
-    }
-
-    if height % 5000 == 0 {
-      storage
-        .insert_ranges(&range_cache)
-        .expect("Failed to insert sat ranges");
-      storage
-        .flush_ranges(&flush_cache)
-        .expect("Failed to flush sat ranges");
-      storage
-        .set_block_height(height)
-        .expect("Failed to set block height");
+    if height != 0 && height % 5000 == 0 {
+      persist(&storage, &mut range_cache, &mut flush_cache, &height);
       range_cache = HashMap::new();
+      flush_cache = Vec::new();
     }
 
     height += 1;
   }
+
+  persist(&storage, &mut range_cache, &mut flush_cache, &height);
+}
+
+fn persist(
+  storage: &Storage,
+  range_cache: &mut HashMap<OutPointValue, Vec<u8>>,
+  flush_cache: &mut Vec<OutPointValue>,
+  height: &u64,
+) {
+  println!("---------- Persisting {} ----------", height);
+
+  storage.insert_ranges(&range_cache);
+  println!("💽 Inserted {} outpoints", range_cache.len());
+
+  storage.flush_ranges(&flush_cache);
+  println!("💽 Deleted {} outpoints", flush_cache.len());
+
+  storage.set_block_height(&height);
+  println!("📦 Done");
 }
 
 fn index_transaction_sats(

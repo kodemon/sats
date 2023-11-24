@@ -1,88 +1,178 @@
-use redb::{Database, Error, ReadableTable, TableDefinition};
+use core::panic;
 use std::collections::HashMap;
-use std::env;
+// use std::env;
+
+use rusqlite::Connection;
 
 use crate::entry::OutPointValue;
 
-const UTXO_TO_RANGE_TABLE: TableDefinition<&OutPointValue, &[u8]> =
-  TableDefinition::new("utxo_to_ranges");
-
-const BLOCK_HEIGHT: TableDefinition<&str, u64> = TableDefinition::new("block_height");
-
-pub struct Storage {
-  db: Database,
+#[derive(Debug)]
+struct Indexer {
+  id: i64,
+  height: u64,
 }
+
+#[derive(Debug)]
+struct Ranges {
+  outpoint: OutPointValue,
+  ranges: Vec<u8>,
+}
+
+pub struct Storage {}
 
 impl Storage {
   pub fn new() -> Storage {
-    let path = env::var("STORAGE_PATH").expect("Storage path is not defined in environment");
-    let db = Database::create(path).expect("Failed to create database");
+    let conn = get_connection();
 
-    Storage { db }
+    conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+
+    conn
+      .execute(
+        "
+        CREATE TABLE IF NOT EXISTS indexer (
+          id      INTEGER PRIMARY KEY AUTOINCREMENT,
+          height  INTEGER NOT NULL
+        )
+        ",
+        (),
+      )
+      .unwrap();
+
+    conn
+      .execute(
+        "
+        CREATE TABLE IF NOT EXISTS ranges (
+          outpoint BLOB PRIMARY KEY,
+          ranges   BLOB NOT NULL
+        )
+        ",
+        (),
+      )
+      .unwrap();
+
+    conn
+      .execute(
+        "
+        CREATE TABLE IF NOT EXISTS flush (
+          outpoint BLOB PRIMARY KEY
+        )
+        ",
+        (),
+      )
+      .unwrap();
+
+    Storage {}
   }
 
-  pub fn set_block_height(&self, height: u64) -> Result<(), Error> {
-    let wtx = self.db.begin_write()?;
+  pub fn set_block_height(&self, height: &u64) {
+    let conn = get_connection();
 
-    {
-      let mut table = wtx.open_table(BLOCK_HEIGHT)?;
-      table.insert("height", &height)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+
+    let mut stmt = conn
+      .prepare("INSERT OR REPLACE INTO indexer (id, height) VALUES (1, ?1)")
+      .unwrap();
+
+    stmt.execute(&[height]).unwrap();
+  }
+
+  pub fn get_block_height(&self) -> u64 {
+    let conn = get_connection();
+
+    conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+
+    let mut stmt = conn
+      .prepare("SELECT id, height FROM indexer WHERE id = 1")
+      .unwrap();
+
+    let indexers = stmt
+      .query_map((), |row| {
+        Ok(Indexer {
+          id: row.get(0)?,
+          height: row.get(1)?,
+        })
+      })
+      .expect("Could not get block height");
+
+    for indexer in indexers {
+      return indexer.unwrap().height;
     }
 
-    wtx.commit().unwrap();
-
-    Ok(())
+    return 0;
   }
 
-  pub fn get_block_height(&self) -> Result<u64, Error> {
-    let read_txn = self.db.begin_read()?;
-    let table = match read_txn.open_table(BLOCK_HEIGHT) {
-      Ok(table) => table,
-      Err(_) => {
-        self.set_block_height(0)?;
-        return Ok(0);
-      }
-    };
-    let binding = table.get("height")?.unwrap();
-    let value = binding.value();
-    Ok(value)
-  }
+  pub fn insert_ranges(&self, ranges: &HashMap<OutPointValue, Vec<u8>>) {
+    let mut conn = get_connection();
 
-  pub fn insert_ranges(&self, ranges: &HashMap<OutPointValue, Vec<u8>>) -> Result<(), Error> {
-    let wtx = self.db.begin_write()?;
+    conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
 
-    {
-      let mut table = wtx.open_table(UTXO_TO_RANGE_TABLE)?;
-      for (key, value) in ranges {
-        table.insert(key, value.as_slice())?;
-      }
+    let tx = conn.transaction().unwrap();
+    for (key, value) in ranges {
+      tx.execute(
+        "INSERT OR IGNORE INTO ranges (outpoint, ranges) VALUES (?, ?)",
+        (key, value.as_slice()),
+      )
+      .unwrap();
     }
 
-    wtx.commit().unwrap();
-
-    Ok(())
+    tx.commit().unwrap();
   }
 
-  pub fn flush_ranges(&self, ranges: &Vec<OutPointValue>) -> Result<(), Error> {
-    let wtx = self.db.begin_write()?;
+  pub fn get_ranges(&self, outpoint: &OutPointValue) -> Vec<u8> {
+    let conn = get_connection();
 
-    {
-      let mut table = wtx.open_table(UTXO_TO_RANGE_TABLE)?;
-      for key in ranges {
-        table.remove(key)?;
-      }
+    conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+
+    let mut stmt = conn
+      .prepare("SELECT outpoint, ranges FROM ranges WHERE outpoint = ?")
+      .unwrap();
+
+    let ranges = stmt
+      .query_map(&[outpoint], |row| {
+        Ok(Ranges {
+          outpoint: row.get(0)?,
+          ranges: row.get(1)?,
+        })
+      })
+      .expect("Could not get block height");
+
+    for range in ranges {
+      return range.unwrap().ranges;
     }
 
-    wtx.commit().unwrap();
-
-    Ok(())
+    panic!("Could not find outpoint in index");
   }
 
-  pub fn get_ranges(&self, outpoint: &OutPointValue) -> Result<Vec<u8>, Error> {
-    let read_txn = self.db.begin_read()?;
-    let table = read_txn.open_table(UTXO_TO_RANGE_TABLE)?;
-    let binding = table.get(outpoint)?.unwrap();
-    let value = binding.value();
-    Ok(Vec::from(value))
+  pub fn flush_ranges(&self, outpoints: &Vec<OutPointValue>) {
+    let mut conn = get_connection();
+
+    conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+
+    let flush = conn.transaction().unwrap();
+    for key in outpoints {
+      flush
+        .execute("INSERT OR IGNORE INTO flush (outpoint) VALUES (?)", [key])
+        .unwrap();
+    }
+    flush.commit().unwrap();
+
+    let mut ranges = conn
+      .prepare(
+        "
+        DELETE FROM ranges WHERE outpoint IN (
+          SELECT outpoint FROM flush
+        )
+        ",
+      )
+      .unwrap();
+
+    ranges.execute(()).unwrap();
+
+    let mut clean = conn.prepare("DELETE FROM flush").unwrap();
+    clean.execute(()).unwrap();
   }
+}
+
+fn get_connection() -> Connection {
+  return Connection::open("./sats.sqlite").unwrap();
 }
