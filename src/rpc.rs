@@ -1,33 +1,28 @@
 use bitcoincore_rpc::bitcoin::{Block, BlockHash};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-// use std::env;
-use std::error::Error;
 
 pub struct RpcClient {
   client: Client,
 }
 
 impl RpcClient {
-  pub fn new() -> RpcClient {
-    let username = String::from("bitcoin"); // env::var("RPC_USER").expect("Bitcoin Core RPC username is not defined in environment");
-    let password = String::from("bitcoin"); // env::var("RPC_PASS").expect("Bitcoin Core RPC password is not defined in environment");
+  pub fn new(host: String, username: String, password: String) -> RpcClient {
     let credential = Auth::UserPass(username, password);
-    let uri = "http://127.0.0.1:18332"; // env::var("RPC_URI").expect("Bitcoin Core RPC Uri is not defined in environment");
-    return RpcClient {
-      client: Client::new(&uri, credential).expect("Unable to connect"),
-    };
+    RpcClient {
+      client: Client::new(&host, credential).expect("Unable to connect"),
+    }
   }
 
-  pub fn getblockcount(&self) -> Result<u64, Box<dyn Error>> {
-    Ok(self.client.get_block_count()? as u64)
+  pub fn get_block(&self, height: &u64) -> Block {
+    let block_hash = self.get_block_hash(&height);
+    return self.client.get_block(&block_hash).unwrap();
   }
 
-  pub fn getblockhash(&self, height: &u64) -> Result<BlockHash, Box<dyn Error>> {
-    let block_hash = self.client.get_block_hash(height.clone())?;
-    Ok(block_hash)
+  pub fn get_block_hash(&self, height: &u64) -> BlockHash {
+    return self.client.get_block_hash(height.clone()).unwrap();
   }
 
-  pub fn getblock(&self, block_hash: &BlockHash) -> Result<Block, Box<dyn Error>> {
-    Ok(self.client.get_block(block_hash)?)
+  pub fn get_block_count(&self) -> u64 {
+    return self.client.get_block_count().unwrap() as u64;
   }
 }

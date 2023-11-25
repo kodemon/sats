@@ -23,7 +23,7 @@ impl Entry for OutPoint {
   fn store(self) -> Self::Value {
     let mut value = [0; 36];
     self.consensus_encode(&mut value.as_mut_slice()).unwrap();
-    return value;
+    value
   }
 }
 
